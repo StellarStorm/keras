@@ -1309,14 +1309,15 @@ class ModelCheckpoint(Callback):
         save_weights_only: if True, then only the model's weights will be saved
           (`model.save_weights(filepath)`), else the full model is saved
           (`model.save(filepath)`).
-        save_freq: `'epoch'` or integer. When using `'epoch'`, the callback
-          saves the model after each epoch. When using integer, the callback
-          saves the model at end of this many batches. If the `Model` is
-          compiled with `steps_per_execution=N`, then the saving criteria will
-          be checked every Nth batch. Note that if the saving isn't aligned to
-          epochs, the monitored metric may potentially be less reliable (it
-          could reflect as little as 1 batch, since the metrics get reset every
-          epoch). Defaults to `'epoch'`.
+        save_freq: 'eval', 'epoch', or an integer. 'eval' exports the model that
+          the evaluator deems the "best". When set to 'epoch', the callback
+          saves the model after each epoch. When an integer is provided, the
+          callback saves the model at the end of that many batches. If the
+          `Model` is compiled with `steps_per_execution=N`, then the saving
+          criteria will be checked every Nth batch. Note that if the saving
+          isn't aligned to epochs, the monitored metric may potentially be less
+          reliable (it could reflect as little as 1 batch, since the metrics get
+          reset every epoch). Defaults to `'epoch'`.
         options: Optional `tf.train.CheckpointOptions` object if
           `save_weights_only` is true or optional `tf.saved_model.SaveOptions`
           object if `save_weights_only` is false.
@@ -1324,6 +1325,11 @@ class ModelCheckpoint(Callback):
           metric to be monitored. Only applies if `save_best_value=True`. Only
           overwrites the model weights already saved if the performance of
           current model is better than this value.
+        best_model_filepath: The filepath where callback saves the best models
+          during evaluation. The filepath can include epoch formatting options,
+          such as 'best-model-{epoch:04d}', to include the training epoch in the
+          file name. The training epoch at which the checkpoint was saved will
+          be used to fill in the epoch placeholder in the path.
         **kwargs: Additional arguments for backwards compatibility. Possible key
           is `period`.
     """
@@ -1339,6 +1345,7 @@ class ModelCheckpoint(Callback):
         save_freq="epoch",
         options=None,
         initial_value_threshold=None,
+        best_model_filepath=None,
         **kwargs,
     ):
         super().__init__()
@@ -1353,6 +1360,7 @@ class ModelCheckpoint(Callback):
         self._batches_seen_since_last_saving = 0
         self._last_batch_seen = 0
         self.best = initial_value_threshold
+        self._best_model_filepath = best_model_filepath
 
         if save_weights_only:
             if options is None or isinstance(
@@ -1426,12 +1434,22 @@ class ModelCheckpoint(Callback):
                 if self.best is None:
                     self.best = np.Inf
 
-        if self.save_freq != "epoch" and not isinstance(self.save_freq, int):
+        if self.save_freq not in ["epoch", "eval"] and not isinstance(
+            self.save_freq, int
+        ):
             raise ValueError(
                 f"Unrecognized save_freq: {self.save_freq}. "
                 'Expected save_freq are "epoch" or integer'
             )
 
+        if self.save_freq == "eval":
+            if self._best_model_filepath is None:
+                raise ValueError(
+                    "If save_freq is used in eval mode, best_model_filepath "
+                    "arg needs to be specified."
+                )
+            self._ckpt_filepath = self.filepath
+            self.filepath = self._best_model_filepath
         # Only the chief worker writes model checkpoints, but all workers
         # restore checkpoint at on_train_begin().
         self._chief_worker_only = False
@@ -1459,7 +1477,7 @@ class ModelCheckpoint(Callback):
 
     def _implements_train_batch_hooks(self):
         # Only call batch hooks when saving on batch
-        return self.save_freq != "epoch"
+        return isinstance(self.save_freq, int)
 
     def on_train_batch_end(self, batch, logs=None):
         if self._should_save_on_batch(batch):
@@ -1474,9 +1492,39 @@ class ModelCheckpoint(Callback):
         if self.save_freq == "epoch":
             self._save_model(epoch=epoch, batch=None, logs=logs)
 
+    def on_test_begin(self, logs=None):
+        """Updates export_index to the latest checkpoint."""
+        if self.save_freq != "eval":
+            super().on_test_begin(logs)
+        else:
+            most_recent_filepath = (
+                self._get_most_recently_modified_file_matching_pattern(
+                    self._ckpt_filepath
+                )
+            )
+            if most_recent_filepath is not None:
+                self.export_index = (
+                    int(
+                        re.match(r".*ckpt-(?P<ckpt>\d+)", most_recent_filepath)[
+                            "ckpt"
+                        ]
+                    )
+                    - 1
+                )
+            else:
+                self.export_index = 0
+
+    def on_test_end(self, logs):
+        """Saves best model at the end of an evaluation epoch."""
+        if self.save_freq != "eval":
+            super().on_test_end(logs)
+        else:
+            self.epochs_since_last_save += 1
+            self._save_model(epoch=self.export_index, batch=None, logs=logs)
+
     def _should_save_on_batch(self, batch):
         """Handles batch-level saving logic, supports steps_per_execution."""
-        if self.save_freq == "epoch":
+        if not isinstance(self.save_freq, int):
             return False
 
         if batch <= self._last_batch_seen:  # New epoch.
@@ -1893,14 +1941,14 @@ class BackupAndRestore(Callback):
 
     def on_train_batch_end(self, batch, logs=None):
         self._training_state.backup_if_preempted()
-        if self.save_freq and self.save_freq != "epoch":
+        if self.save_freq and isinstance(self.save_freq, int):
             self._batches_count += 1
             if self._batches_count >= self.save_freq:
                 self._batches_count = 0
                 self._back_up(epoch=self._current_epoch, batch=batch)
 
     def _implements_train_batch_hooks(self):
-        return self.save_freq != "epoch"
+        return isinstance(self.save_freq, int)
 
     def on_train_end(self, logs=None):
         if self.delete_checkpoint:
